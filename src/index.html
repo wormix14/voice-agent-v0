@@ -1,0 +1,398 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Autonomous Voice Assistant</title>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: #090d16;
+      color: #e2e8f0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      margin: 0;
+    }
+
+    .container {
+      background: #131b2e;
+      border: 1px solid #1e293b;
+      padding: 36px 32px;
+      border-radius: 16px;
+      width: 100%;
+      max-width: 400px;
+      text-align: center;
+      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+    }
+
+    h2 {
+      margin-top: 0;
+      margin-bottom: 20px;
+      color: #38bdf8;
+    }
+
+    .status-container {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 10px;
+      margin-bottom: 28px;
+      font-size: 15px;
+      color: #94a3b8;
+      min-height: 24px;
+    }
+
+    .indicator {
+      width: 12px;
+      height: 12px;
+      border-radius: 50%;
+      background: #64748b;
+      transition: all 0.2s ease;
+    }
+
+    .indicator.listening {
+      background: #ef4444;
+      box-shadow: 0 0 10px #ef4444;
+    }
+
+    .indicator.speaking {
+      background: #38bdf8;
+      box-shadow: 0 0 10px #38bdf8;
+    }
+
+    button {
+      background: #0284c7;
+      color: white;
+      border: none;
+      padding: 14px 28px;
+      font-size: 16px;
+      font-weight: 600;
+      border-radius: 10px;
+      cursor: pointer;
+      width: 100%;
+      transition: all 0.2s ease;
+    }
+
+    button:hover:not(:disabled) {
+      background: #0369a1;
+    }
+
+    button.stop {
+      background: #e11d48;
+    }
+
+    button.stop:hover:not(:disabled) {
+      background: #be123c;
+    }
+
+    button:disabled {
+      background: #334155;
+      color: #64748b;
+      cursor: not-allowed;
+    }
+  </style>
+</head>
+<body>
+
+  <div class="container">
+    <h2>Voice Assistant</h2>
+    
+    <div class="status-container">
+      <span id="dot" class="indicator"></span>
+      <span id="status">Click the button to start</span>
+    </div>
+
+    <button id="actionBtn">Start Conversation</button>
+  </div>
+
+  <script>
+    let sessionId = "sess_" + Math.random().toString(36).substring(2, 9);
+    const topic = "Transport Orders";
+
+    const actionBtn = document.getElementById("actionBtn");
+    const statusText = document.getElementById("status");
+    const dot = document.getElementById("dot");
+
+    let currentState = "IDLE"; // IDLE, GREETING, LISTENING, PROCESSING, SPEAKING, TERMINATED
+    let audioContext = null;
+    let micStream = null;
+    let mediaRecorder = null;
+    let audioChunks = [];
+    let silenceTimer = null;
+    let vadAnimationId = null;
+
+    let currentAudioElement = null;
+    let activeStreamReader = null;
+    let lastVoiceDetectedAt = 0;
+    let voiceFrameCounter = 0;
+
+    function transitionTo(newState, statusLabel = "", indicatorMode = "") {
+      currentState = newState;
+      if (statusLabel) statusText.innerText = statusLabel;
+      dot.className = "indicator " + indicatorMode;
+    }
+
+    function clearSilence() {
+      if (silenceTimer) {
+        clearTimeout(silenceTimer);
+        silenceTimer = null;
+      }
+    }
+
+    function stopCurrentBotAudio() {
+      if (currentAudioElement) {
+        currentAudioElement.pause();
+        currentAudioElement.currentTime = 0;
+        currentAudioElement = null;
+      }
+      if (activeStreamReader) {
+        activeStreamReader.cancel().catch(() => {});
+        activeStreamReader = null;
+      }
+    }
+
+    function playAudioChunk(base64Data) {
+      return new Promise((resolve) => {
+        if (currentState !== "SPEAKING" && currentState !== "GREETING") {
+          return resolve();
+        }
+
+        currentAudioElement = new Audio("data:audio/wav;base64," + base64Data);
+        currentAudioElement.onended = () => { currentAudioElement = null; resolve(); };
+        currentAudioElement.onerror = () => { currentAudioElement = null; resolve(); };
+        currentAudioElement.play().catch(() => { currentAudioElement = null; resolve(); });
+      });
+    }
+
+    function terminateSession() {
+      transitionTo("TERMINATED", "Session finished", "");
+      clearSilence();
+      stopCurrentBotAudio();
+
+      if (vadAnimationId) {
+        cancelAnimationFrame(vadAnimationId);
+        vadAnimationId = null;
+      }
+
+      if (mediaRecorder && mediaRecorder.state !== "inactive") {
+        mediaRecorder.stop();
+      }
+
+      if (micStream) {
+        micStream.getTracks().forEach(track => track.stop());
+        micStream = null;
+      }
+
+      if (audioContext && audioContext.state !== "closed") {
+        audioContext.close();
+      }
+
+      actionBtn.innerText = "Start Over";
+      actionBtn.className = "";
+      actionBtn.disabled = false;
+      currentState = "IDLE";
+    }
+
+function setupAudioProcessor(stream) {
+      audioContext = new (window.AudioContext || window.webkitAudioContext)();
+      const source = audioContext.createMediaStreamSource(stream);
+
+      const filter = audioContext.createBiquadFilter();
+      filter.type = "bandpass";
+      filter.frequency.value = 1000;
+      filter.Q.value = 0.8;
+
+      const analyser = audioContext.createAnalyser();
+      analyser.fftSize = 512;
+      analyser.smoothingTimeConstant = 0.4; // сглаживание резких провалов громкости
+
+      source.connect(filter);
+      filter.connect(analyser);
+
+      const buffer = new Float32Array(analyser.fftSize);
+      let silenceFramesCount = 0;
+
+      function loop() {
+        if (currentState === "IDLE" || currentState === "TERMINATED") return;
+
+        analyser.getFloatTimeDomainData(buffer);
+        let sumSquares = 0;
+        for (let i = 0; i < buffer.length; i++) {
+          sumSquares += buffer[i] * buffer[i];
+        }
+        const rms = Math.sqrt(sumSquares / buffer.length);
+
+        // Пониженный порог для уверенного захвата речи и окончаний фраз
+        const SPEECH_THRESHOLD = 0.020;
+
+        if (rms > SPEECH_THRESHOLD) {
+          silenceFramesCount = 0;
+          voiceFrameCounter++;
+
+          // Голос подтвержден
+          if (voiceFrameCounter >= 3) {
+            lastVoiceDetectedAt = Date.now();
+
+            // Сбрасываем таймер тишины, если он уже начал отсчет
+            clearSilence();
+
+            if (currentState === "SPEAKING") {
+              stopCurrentBotAudio();
+              startListening();
+            }
+          }
+        } else {
+          voiceFrameCounter = 0;
+
+          // Фиксируем тишину только если она длится стабильно (хотя бы ~150 мс)
+          silenceFramesCount++;
+
+          if (
+            currentState === "LISTENING" &&
+            !silenceTimer &&
+            lastVoiceDetectedAt > 0 &&
+            silenceFramesCount > 8
+          ) {
+            // Даем 2 секунды (2000 мс) тишины на спокойную паузу между словами
+            silenceTimer = setTimeout(() => {
+              if (currentState === "LISTENING") {
+                commitRecording();
+              }
+            }, 1600);
+          }
+        }
+
+        vadAnimationId = requestAnimationFrame(loop);
+      }
+
+      loop();
+    }
+
+    function startListening() {
+      clearSilence();
+      lastVoiceDetectedAt = 0;
+      voiceFrameCounter = 0;
+      audioChunks = [];
+
+      if (!mediaRecorder) return;
+
+      if (mediaRecorder.state === "inactive") {
+        mediaRecorder.start();
+      }
+      transitionTo("LISTENING", "Listening... Please speak", "listening");
+    }
+
+    function commitRecording() {
+      clearSilence();
+      if (!mediaRecorder || mediaRecorder.state !== "recording" || lastVoiceDetectedAt === 0) return;
+
+      transitionTo("PROCESSING", "Processing response...", "");
+      mediaRecorder.stop();
+    }
+
+    async function sendPayload(blob) {
+      const form = new FormData();
+      form.append("audio", blob, "input.wav");
+      form.append("session_id", sessionId);
+      form.append("topic", topic);
+
+      try {
+        const res = await fetch("/voice-chat", { method: "POST", body: form });
+        activeStreamReader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+
+        while (true) {
+          const { done, value } = await activeStreamReader.read();
+          if (done) break;
+
+          buffer += decoder.decode(value, { stream: true });
+          const parts = buffer.split("\n\n");
+          buffer = parts.pop();
+
+          for (const raw of parts) {
+            const line = raw.trim();
+            if (!line.startsWith("data: ")) continue;
+
+            const event = JSON.parse(line.replace("data: ", ""));
+            if (event.type === "audio_delta") {
+              transitionTo("SPEAKING", "Assistant is responding...", "speaking");
+              await playAudioChunk(event.audio64);
+            } else if (event.type === "done") {
+              if (event.session_finished) {
+                terminateSession();
+                return;
+              } else {
+                startListening();
+              }
+            }
+          }
+        }
+      } catch (err) {
+        if (err.name !== "AbortError") {
+          console.error("Transmission error:", err);
+        }
+        if (currentState !== "IDLE" && currentState !== "TERMINATED") {
+          startListening();
+        }
+      }
+    }
+
+    actionBtn.onclick = async () => {
+      if (currentState !== "IDLE" && currentState !== "TERMINATED") {
+        terminateSession();
+        return;
+      }
+
+      sessionId = "sess_" + Math.random().toString(36).substring(2, 9);
+      actionBtn.disabled = true;
+      transitionTo("PROCESSING", "Connecting...");
+
+      try {
+        micStream = await navigator.mediaDevices.getUserMedia({
+          audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+        });
+
+        mediaRecorder = new MediaRecorder(micStream);
+        mediaRecorder.ondataavailable = (e) => {
+          if (e.data && e.data.size > 0) audioChunks.push(e.data);
+        };
+        mediaRecorder.onstop = () => {
+          if (audioChunks.length > 0 && currentState === "PROCESSING") {
+            const recordedBlob = new Blob(audioChunks, { type: "audio/wav" });
+            audioChunks = [];
+            sendPayload(recordedBlob);
+          }
+        };
+
+        setupAudioProcessor(micStream);
+
+        actionBtn.innerText = "End Conversation";
+        actionBtn.className = "stop";
+        actionBtn.disabled = false;
+
+        transitionTo("GREETING", "Preparing greeting...");
+        const form = new FormData();
+        form.append("session_id", sessionId);
+        form.append("topic", topic);
+
+        const res = await fetch("/send-greeting", { method: "POST", body: form });
+        const data = await res.json();
+
+        transitionTo("GREETING", "Assistant is speaking...", "speaking");
+        await playAudioChunk(data.audio64);
+
+        startListening();
+      } catch (err) {
+        console.error("Initialization failed:", err);
+        transitionTo("IDLE", "Microphone access error");
+        actionBtn.disabled = false;
+        actionBtn.innerText = "Start Conversation";
+        actionBtn.className = "";
+      }
+    };
+  </script>
+</body>
+</html>
